@@ -120,11 +120,11 @@ class Agent:
     def __init__(self, config):
         self.online_actor = config.actor_fn().to(DEVICE)
         self.target_actor = config.actor_fn().to(DEVICE)
-        self.actor_opt = config.actor_opt_fn(self.online_actor.parameters())
+        self.online_actor_opt = config.actor_opt_fn(self.online_actor.parameters())
 
         self.online_critic = config.critic_fn().to(DEVICE)
         self.target_critic = config.critic_fn().to(DEVICE)
-        self.critic_opt = config.critic_opt_fn(self.online_critic.parameters())
+        self.online_critic_opt = config.critic_opt_fn(self.online_critic.parameters())
 
         self.noise = config.noise_fn()
 
@@ -143,7 +143,7 @@ class Agent:
         self.online_actor.train()
 
         action += self.noise.sample()
-        return action
+        return np.clip(action, -1, 1)
 
 
 # https://github.com/ikostrikov/pytorch-ddpg-naf/blob/master/ddpg.py#L11
@@ -163,79 +163,49 @@ def soft_update(target, source, tau):
 class MultiAgent:
     def __init__(self, config):
         self.config = config
-        self.agents = [Agent(config) for _ in range(config.num_agents)]
-        self.iter = 0
-
-    def get_online_actors(self):
-        return [agent.online_actor for agent in self.agents]
-
-    def get_target_actors(self):
-        return [agent.target_actor for agent in self.agents]
+        self.agent = Agent(config)
 
     def act(self, states):
-        return np.array([agent.act(state) for agent, state in zip(self.agents, states)])
+        return np.array([self.agent.act(state) for state in states])
 
     def learn(self, transitions, agent_idx):
-        """update the critics and actors of all the agents """
-
-        # need to transpose each element of the samples
-        # to flip obs[parallel_agent][agent_number] to
-        # obs[agent_number][parallel_agent]
-        states, full_state, actions, rewards, next_states, next_full_states, dones = transpose_to_tensor(transitions)
-
-        full_state = torch.stack(full_state)
-        next_full_states = torch.stack(next_full_states)
-
-        agent = self.agents[agent_idx]
-        agent.critic_opt.zero_grad()
-
-        # critic loss = batch mean of (y- Q(s,a) from target network)^2
-        # y = reward of this timestep + discount * Q(st+1,at+1) from target network
-        target_actions = self.target_act(next_states)
-        target_actions = torch.cat(target_actions, dim=1)
-        target_critic_input = torch.cat((next_full_states.t(), target_actions), dim=1).to(DEVICE)
+        state, full_state, action, reward, next_state, next_full_state, done = transpose_to_tensor(transitions)
 
         with torch.no_grad():
-            q_next = agent.target_critic(target_critic_input)
+            target_next_action = [self.agent.target_actor(next_state[:, i, :])
+                                  for i in range(self.config.num_agents)]
 
-        y = rewards[agent_idx].view(-1, 1) + self.config.discount * q_next * (1 - dones[agent_idx].view(-1, 1))
+        target_next_action = torch.cat(target_next_action, dim=1)
 
-        actions = torch.cat(actions, dim=1)
-        critic_input = torch.cat((full_state.t(), actions), dim=1).to(DEVICE)
-        q = agent.online_critic(critic_input)
+        with torch.no_grad():
+            target_next_q = self.agent.target_critic(next_full_state.to(DEVICE), target_next_action.to(DEVICE))
 
-        huber_loss = torch.nn.SmoothL1Loss()
-        critic_loss = huber_loss(q, y.detach())
-        critic_loss.backward()
-        # torch.nn.utils.clip_grad_norm_(agent.critic.parameters(), 0.5)
-        agent.critic_opt.step()
+        target_q = reward[:, agent_idx].view(-1, 1) + self.config.discount * target_next_q * (1 - done[:, agent_idx].view(-1, 1))
 
-        # update actor network using policy gradient
-        agent.actor_opt.zero_grad()
-        # make input to agent
-        # detach the other agents to save computation
-        # saves some time for computing derivative
-        q_input = [self.agents[i].online_actor(ob) if i == agent_idx else self.agents[i].online_actor(ob).detach()
-                   for i, ob in enumerate(states)]
+        action = action.view(action.shape[0], -1)
+        online_q = self.agent.online_critic(full_state.to(DEVICE), action.to(DEVICE))
 
-        q_input = torch.cat(q_input, dim=1)
-        # combine all the actions and observations for input to critic
-        # many of the obs are redundant, and obs[1] contains all useful information already
-        q_input2 = torch.cat((full_state.t(), q_input), dim=1)
+        online_critic_loss = F.mse_loss(online_q, target_q.detach())
 
-        # get the policy gradient
-        actor_loss = -agent.online_critic(q_input2).mean()
+        self.agent.online_critic_opt.zero_grad()
+        online_critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.agent.online_critic.parameters(), 1)
+        self.agent.online_critic_opt.step()
+
+        online_action = [self.agent.online_actor(state[:, i, :])
+                         for i in range(self.config.num_agents)]
+        online_action = torch.cat(online_action, dim=1)
+        actor_loss = -self.agent.online_critic(full_state.to(DEVICE), online_action.to(DEVICE)).mean()
+
+        self.agent.online_actor_opt.zero_grad()
         actor_loss.backward()
         # torch.nn.utils.clip_grad_norm_(agent.actor.parameters(),0.5)
-        agent.actor_opt.step()
+        self.agent.online_actor_opt.step()
 
     def update_targets(self):
         """soft update targets"""
-        self.iter += 1
-
-        for agent in self.agents:
-            soft_update(agent.target_actor, agent.online_actor, self.config.target_mix)
-            soft_update(agent.target_critic, agent.online_critic, self.config.target_mix)
+        soft_update(self.agent.target_actor, self.agent.online_actor, self.config.target_mix)
+        soft_update(self.agent.target_critic, self.agent.online_critic, self.config.target_mix)
 
 
 def random_play(config):
@@ -350,10 +320,10 @@ def main():
     config.actor_fn = lambda: Actor(config.state_size, config.action_size, 128, 128)
     config.actor_opt_fn = lambda params: optim.Adam(params, lr=1e-3)
 
-    config.critic_fn = lambda: Critic(config.state_size + config.num_agents * config.action_size, 1, 128, 128)
+    config.critic_fn = lambda: Critic(config.state_size * config.num_agents, config.action_size * config.num_agents, 128, 128)
     config.critic_opt_fn = lambda params: optim.Adam(params, lr=1e-3)
 
-    config.replay_fn = lambda: Replay(config.action_size, buffer_size=int(1e6), batch_size=256)
+    config.replay_fn = lambda: Replay(config.action_size, buffer_size=int(1e6), batch_size=128)
     config.noise_fn = lambda: OUNoise(config.action_size, mu=0., theta=0.15, sigma=0.05)
 
     config.discount = 0.99
