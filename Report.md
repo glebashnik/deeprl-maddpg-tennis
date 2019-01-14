@@ -8,7 +8,7 @@ the Collaboration and Competition project from Udacity Deep Reinforcement Learni
 My solution implements an adaptation of Multi-Agent Deep Deterministic Policy Gradients (MADDPG) algorithm as proposed by
 Lowe, Ryan, et al. "Multi-agent actor-critic for mixed cooperative-competitive environments." for the collaborative self-play agent.
 
-The implementation is done in Python using PyTorch. 
+The implementation is done in Python using PyTorch based on my implementation of the DDPG for the [previous project](https://github.com/glebashnik/udacity-deeprl-continuous-control).
 
 ## Learning Algorithm
 
