@@ -1,17 +1,13 @@
-import os
-import random
 import copy
-from collections import deque, namedtuple
+import random
+from collections import deque
 
-import numpy as np
-import progressbar as pb
 import matplotlib.pyplot as plt
-
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-
 from unityagents import UnityEnvironment
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -111,13 +107,20 @@ def transpose_to_tensor(tuples):
     return list(map(to_tensor, zip(*tuples)))
 
 
-def hard_update(target, source):
-    for target_param, param in zip(target.parameters(), source.parameters()):
+def hard_update(target_model, source_model):
+    for target_param, param in zip(target_model.parameters(), source_model.parameters()):
         target_param.data.copy_(param.data)
 
 
-class Agent:
+def soft_update(target_model, source_model, mix):
+    for target_param, online_param in zip(target_model.parameters(), source_model.parameters()):
+        target_param.data.copy_(target_param.data * (1.0 - mix) + online_param.data * mix)
+
+
+class SelfPlayAgent:
     def __init__(self, config):
+        self.config = config
+
         self.online_actor = config.actor_fn().to(DEVICE)
         self.target_actor = config.actor_fn().to(DEVICE)
         self.online_actor_opt = config.actor_opt_fn(self.online_actor.parameters())
@@ -126,155 +129,128 @@ class Agent:
         self.target_critic = config.critic_fn().to(DEVICE)
         self.online_critic_opt = config.critic_opt_fn(self.online_critic.parameters())
 
-        self.noise = config.noise_fn()
+        self.noises = [config.noise_fn() for _ in range(config.num_agents)]
+        self.replay = config.replay_fn()
 
-        # initialize targets same as original networks
         hard_update(self.target_actor, self.online_actor)
         hard_update(self.target_critic, self.online_critic)
 
-    def act(self, state):
-        state = torch.from_numpy(state).float().to(DEVICE)
+    def act(self, states):
+        state = torch.from_numpy(states).float().to(DEVICE)
 
         self.online_actor.eval()
 
         with torch.no_grad():
-            action = self.online_actor(state).cpu().numpy().flatten()
+            action = self.online_actor(state).cpu().numpy()
 
         self.online_actor.train()
 
-        action += self.noise.sample()
+        action += [n.sample() for n in self.noises]
         return np.clip(action, -1, 1)
 
+    def step(self, states, actions, rewards, next_states, dones):
+        full_state = states.flatten()
+        next_full_state = next_states.flatten()
+        self.replay.add((states, full_state, actions, rewards, next_states, next_full_state, dones))
 
-# https://github.com/ikostrikov/pytorch-ddpg-naf/blob/master/ddpg.py#L11
-def soft_update(target, source, tau):
-    """
-    Perform DDPG soft update (move target params toward source based on weight
-    factor tau)
-    Inputs:
-        target (torch.nn.Module): Net to copy parameters to
-        source (torch.nn.Module): Net whose parameters to copy
-        tau (float, 0 < x < 1): Weight factor for update
-    """
-    for target_param, param in zip(target.parameters(), source.parameters()):
-        target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
+        if len(self.replay) > self.replay.batch_size:
+            self.learn()
 
+    def learn(self):
+        # Sample a batch of transitions from the replay buffer
+        transitions = self.replay.sample()
+        states, full_state, actions, rewards, next_states, next_full_state, dones = transpose_to_tensor(transitions)
 
-class MultiAgent:
-    def __init__(self, config):
-        self.config = config
-        self.agent = Agent(config)
-
-    def act(self, states):
-        return np.array([self.agent.act(state) for state in states])
-
-    def learn(self, transitions, agent_idx):
-        state, full_state, action, reward, next_state, next_full_state, done = transpose_to_tensor(transitions)
-
+        # Update online critic model
+        # Compute actions for next states with the target actor model
         with torch.no_grad():
-            target_next_action = [self.agent.target_actor(next_state[:, i, :])
-                                  for i in range(self.config.num_agents)]
+            target_next_actions = [self.target_actor(next_states[:, i, :]) for i in range(self.config.num_agents)]
 
-        target_next_action = torch.cat(target_next_action, dim=1)
+        target_next_actions = torch.cat(target_next_actions, dim=1)
 
+        # Compute Q values for the next states and next actions with the target critic model
         with torch.no_grad():
-            target_next_q = self.agent.target_critic(next_full_state.to(DEVICE), target_next_action.to(DEVICE))
+            target_next_qs = self.target_critic(next_full_state.to(DEVICE), target_next_actions.to(DEVICE))
 
-        target_q = reward[:, agent_idx].view(-1, 1) + self.config.discount * target_next_q * (1 - done[:, agent_idx].view(-1, 1))
+        # Compute Q values for the current states and actions with the Bellman equation
+        target_qs = rewards.sum(1, keepdim=True)
+        target_qs += self.config.discount * target_next_qs * (1 - dones.max(1, keepdim=True)[0])
 
-        action = action.view(action.shape[0], -1)
-        online_q = self.agent.online_critic(full_state.to(DEVICE), action.to(DEVICE))
+        # Compute Q values for the current states and actions with the online critic model
+        actions = actions.view(actions.shape[0], -1)
+        online_qs = self.online_critic(full_state.to(DEVICE), actions.to(DEVICE))
 
-        online_critic_loss = F.mse_loss(online_q, target_q.detach())
-
-        self.agent.online_critic_opt.zero_grad()
+        # Compute and minimize the online critic loss
+        online_critic_loss = F.mse_loss(online_qs, target_qs.detach())
+        self.online_critic_opt.zero_grad()
         online_critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.agent.online_critic.parameters(), 1)
-        self.agent.online_critic_opt.step()
+        torch.nn.utils.clip_grad_norm_(self.online_critic.parameters(), 1)
+        self.online_critic_opt.step()
 
-        online_action = [self.agent.online_actor(state[:, i, :])
-                         for i in range(self.config.num_agents)]
-        online_action = torch.cat(online_action, dim=1)
-        actor_loss = -self.agent.online_critic(full_state.to(DEVICE), online_action.to(DEVICE)).mean()
+        # Update online actor model
+        # Compute actions for the current states with the online actor model
+        online_actions = [self.online_actor(states[:, i, :]) for i in range(self.config.num_agents)]
+        online_actions = torch.cat(online_actions, dim=1)
+        # Compute the online actor loss with the online critic model
+        online_actor_loss = -self.online_critic(full_state.to(DEVICE), online_actions.to(DEVICE)).mean()
+        # Minimize the online critic loss
+        self.online_actor_opt.zero_grad()
+        online_actor_loss.backward()
+        self.online_actor_opt.step()
 
-        self.agent.online_actor_opt.zero_grad()
-        actor_loss.backward()
-        # torch.nn.utils.clip_grad_norm_(agent.actor.parameters(),0.5)
-        self.agent.online_actor_opt.step()
-
-    def update_targets(self):
-        """soft update targets"""
-        soft_update(self.agent.target_actor, self.agent.online_actor, self.config.target_mix)
-        soft_update(self.agent.target_critic, self.agent.online_critic, self.config.target_mix)
-
-
-def random_play(config):
-    for i in range(1, 6):                                      # play game for 5 episodes
-        env_info = config.env.reset(train_mode=False)[config.brain_name]     # reset the environment
-        states = env_info.vector_observations                  # get the current state (for each agent)
-        scores = np.zeros(config.num_agents)                          # initialize the score (for each agent)
-
-        while True:
-            actions = np.random.randn(config.num_agents, config.action_size) # select an action (for each agent)
-            actions = np.clip(actions, -1, 1)                  # all actions between -1 and 1
-            env_info = config.env.step(actions)[config.brain_name]           # send all actions to tne environment
-            next_states = env_info.vector_observations         # get next state (for each agent)
-            rewards = env_info.rewards                         # get reward (for each agent)
-            dones = env_info.local_done                        # see if episode finished
-            scores += env_info.rewards                         # update the score (for each agent)
-            states = next_states                               # roll over states to next time step
-
-            print(states)
-            if np.any(dones):                                  # exit loop if episode finished
-                break
-        # (2 + 2 + 2) * 3 = 24
-        print('Score (max over agents) from episode {}: {}'.format(i, np.max(scores)))
-
-    config.env.close()
+        # Update target critic and actor models
+        soft_update(self.target_actor, self.online_actor, self.config.target_mix)
+        soft_update(self.target_critic, self.online_critic, self.config.target_mix)
 
 
-def run(config):
-    magent = MultiAgent(config)
-    replay = config.replay_fn()
-    scores = [[]] * config.num_agents
+def run(agent):
+    config = agent.config
+    scores_deque = deque(maxlen=100)
+    scores = []
+    mean_scores = []
 
-    # use keep_awake to keep workspace from disconnecting
     for episode in range(config.max_episodes):
+        score = np.zeros(config.num_agents)
         env_info = config.env.reset(train_mode=True)[config.brain_name]
         states = env_info.vector_observations
-        full_state = states.flatten()
-        score = np.zeros(config.num_agents)
 
         for step in range(config.max_steps):
-            actions = magent.act(states)
+            actions = agent.act(states)
             env_info = config.env.step(actions)[config.brain_name]
             next_states = env_info.vector_observations
-            next_full_state = next_states.flatten()
             rewards = env_info.rewards
             dones = env_info.local_done
 
-            transition = (states, full_state, actions, rewards, next_states, next_full_state, dones)
-            replay.add(transition)
+            agent.step(states, actions, rewards, next_states, dones)
 
             score += rewards
-            states, full_state = next_states, next_full_state
-
-            if len(replay) > replay.batch_size:
-                for i in range(config.num_agents):
-                    transitions = replay.sample()
-                    magent.learn(transitions, i)
-
-                magent.update_targets()
+            states = next_states
 
             if np.any(dones):
                 break
 
-        for i in range(config.num_agents):
-            scores[i].append(score[i])
+        score = score.max()
+        scores.append(score)
+        scores_deque.append(score)
+        mean_score = np.mean(scores_deque)
+        mean_scores.append(mean_score)
 
-        print('\rEpisode {}\tAverage scores: {}'.format(episode, np.array_str(score, precision=2)))
+        print('\rEpisode {}\tAverage Score: {:.2f}\tScore: {:.2f}'.format(episode, mean_score, score))
 
-    config.env.close()
+        if mean_score >= config.goal_score:
+            break
+
+    torch.save(agent.online_actor.state_dict(), config.actor_path)
+    torch.save(agent.online_critic.state_dict(), config.critic_path)
+
+    fig, ax = plt.subplots()
+    x = np.arange(1, len(scores) + 1)
+    ax.plot(x, scores)
+    ax.plot(x, mean_scores)
+    ax.set_ylabel('Score')
+    ax.set_xlabel('Episode #')
+    fig.savefig(config.scores_path)
+    plt.show()
 
 
 class Config:
@@ -321,25 +297,24 @@ def main():
     config.actor_opt_fn = lambda params: optim.Adam(params, lr=1e-3)
 
     config.critic_fn = lambda: Critic(config.state_size * config.num_agents, config.action_size * config.num_agents, 128, 128)
-    config.critic_opt_fn = lambda params: optim.Adam(params, lr=1e-3)
+    config.critic_opt_fn = lambda params: optim.Adam(params, lr=2e-3)
 
     config.replay_fn = lambda: Replay(config.action_size, buffer_size=int(1e6), batch_size=128)
-    config.noise_fn = lambda: OUNoise(config.action_size, mu=0., theta=0.15, sigma=0.05)
+    config.noise_fn = lambda: OUNoise(config.action_size, mu=0., theta=0.15, sigma=0.1)
 
     config.discount = 0.99
-    config.target_mix = 1e-3
+    config.target_mix = 3e-3
 
-    config.max_episodes = int(1000)
+    config.max_episodes = 1000
     config.max_steps = int(1e6)
-    config.goal_score = 30
+    config.goal_score = 1
 
     config.actor_path = 'actor.pth'
     config.critic_path = 'critic.pth'
     config.scores_path = 'scores.png'
 
-    #random_play(config)
-    # agent = Agent(config)
-    run(config)
+    agent = SelfPlayAgent(config)
+    run(agent)
 
 
 if __name__ == '__main__':
