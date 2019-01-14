@@ -4,46 +4,47 @@
 
 This report describes my solution to the Tennis environment as part of 
 the Collaboration and Competition project from Udacity Deep Reinforcement Learning Nanodegree. 
-It solves the environment with one agent and achieves an average score of +0.5 over consecutive 100 episodes after 592 episodes.
 
-My solution implements a variation of Multi-Agent Deep Deterministic Policy Gradients (MADDPG) algorithm as proposed by
-Lowe, Ryan, et al. "Multi-agent actor-critic for mixed cooperative-competitive environments."
+My solution implements an adaptation of Multi-Agent Deep Deterministic Policy Gradients (MADDPG) algorithm as proposed by
+Lowe, Ryan, et al. "Multi-agent actor-critic for mixed cooperative-competitive environments." for the collaborative self-play agent.
 
 The implementation is done in Python using PyTorch. 
 
 ## Learning Algorithm
 
-The learning algorithm for the Tennis environment is implemented in the [tennis.py](tennis.py) file. 
-Learning of continuous actions requires an actor (`Actor` class) and a critic (`Critic` class) model.
+The learning algorithm for the Tennis environment is implemented in [tennis.py](tennis.py). 
+The algorithm is similar to MADDPG an actor (`Actor` class) and a critic (`Critic` class) models.
+The main difference from MADDPG is that agents share actor and critic models. 
 The actor model learns to predict an action vector given the state of the environment as observed by the agent.
-The critic model learns Q values for combined states and actions from all the agents in the environment.
-That is, the actor only relies on local information while the critic uses global information.
+The critic model learns Q-values for combined states and actions from all the agents in the environment.
+In this way, the actor only relies on local information while the critic uses global information.
 
 The experience replay (`Replay` class) is used to sample batches of uncorrelated experiences to train on. 
-It also distinguishes between online and target models for both actor and critic, similar to fixed Q-targets and double DQN technique.
+It also uses target models for both actor and critic, similar to fixed Q-targets and double DQN technique.
 Online models are updated by minimizing loses while target models are updated through soft update, 
 i.e. online model parameters values are partially transferred to target models. 
 This helps to avoid overestimation of Q-values and makes the training more stable.
 
-The core of MADDPG algorithm is implemented in the `SelfPlayAgent` class.
-Both agents use the same actor and critic models.
-The `act` method generates actions for all the agents given locally observed states with the online actor model.
-
+The learning algorithm is implemented in the `SelfPlayAgent` class. 
+Since all agents use the same actor and critic model, 
+the agent computes actions and learns for agents on both sides.
+The `act` method accepts local states and returns actions for all agents.
 Noise is added to the actions to allow exploration of the the action space.
-The noise is generated through the Ornstein–Uhlenbeck process, 
+The noise is generated through the Ornstein–Uhlenbeck process, one per agent, 
 which is a stochastic process that is both Gaussian and Markov, drifting towards the mean in long-term.
-The `learn` method implements updates to the models and has the following flow:
 
-1. A batch of experiences is sampled from the replay buffer.
+The `learn` method updates actor and critic model based on experiences (transitions) from all agents at the same time:
+
+1. A batch of transitions is sampled from the replay buffer.
 2. Update online critic model
-    1. Predict actions for the next states with the target actor model
+    1. Compute actions for the next states with the target actor model
     2. Compute Q-values for the next states and actions with the target critic model
     3. Compute target Q-values for the current states and actions using the Bellman equation
-    4. Compute Q values for the current states and actions with the online critic model
+    4. Compute Q-values for the current states and actions with the online critic model
     5. Use the target and online Q-values to compute the loss
     6. Minimize the loss for the online critic model
 3. Update online actor model
-    1. Predict actions for current states from the online actor model
+    1. Compute actions for current states with the online actor model
     2. Compute Q-values with the online critic model
     3. Use the Q-values to compute the loss
     4. Minimize the loss for the online actor model
@@ -51,74 +52,64 @@ The `learn` method implements updates to the models and has the following flow:
 
 Training of the agent is implemented in the `run` function, which has the following flow:
 
-1. Every timestep a state of the environment is observed
-2. The agent selects an action
-3. The environment provides the next state, the reward received and the information whether the episode is completed.
-4. State, action, next state and the reward constitute the experience that the agent adds to its replay buffer.
+1. Every timestep, the environment provides states as observed by each agent
+2. The agent computes actions for these states.
+3. Given the actions, the environment provides next states, rewards and whether the episode is completed for each agent.
+4. States, actions, next states and the rewards constitute the transition that is added to replay buffer.
 5. When enough experiences are collected the agent learns as described above.
+
+One distinguishing feature of my implementation is that when computing Q-values with Bellman equation, 
+the rewards of all agents are added together. 
+It makes sense in the collaborative environment when both agents should perform well to achieve high scores.
  
 ## Network architecture
 
-DDPG uses two network architectures, one for actor and one for critic.
+The agent uses two network architectures, one for actor and one for critic.
 The actor network maps state to action and has the following structure:
  
-1. State input (33 units)
-2. Hidden layer (256 units) with ReLU activation and batch normalization
-3. Hidden layer (256 units) with ReLU activation and batch normalization
-4. Action output (4 units) with tanh activation
+1. State input (24 units)
+2. Hidden layer (128 units) with ReLU activation and batch normalization
+3. Hidden layer (128 units) with ReLU activation and batch normalization
+4. Action output (2 units) with tanh activation
 
-The critic network maps state and action to Q value and has the following structure:
-1. State input (33 units)
-2. Hidden layer (256 nodes) with ReLU activation and batch normalization
-3. Action input (4 units)
-4. Hidden layer with inputs from layers 2 and 3 (256 nodes) with ReLU activation and batch normalization
+The critic network maps combined states and actions of both agents to Q value and has the following structure:
+
+1. Input for local states of both agents (24 * 2 = 48 units)
+2. Hidden layer (128 nodes) with ReLU activation and batch normalization
+3. Input for actions of both agents (2 * 2 = 4 units)
+4. Hidden layer with inputs from layers 2 and 3 (128 nodes) with ReLU activation and batch normalization
 5. Q-value output (1 node)
 
 ## Hyperparameters
-
-Values for the hyperparameters were obtained from the original paper and reference implementations 
-and then tweaked based on the results of multiple runs.
-One of the most important parameters to get right was the standard deviation of the Ornstein–Uhlenbeck process (sigma). 
-It controls the exploration-exploitation trade-off.
-The reference value of 0.2 was too high for the environment, resulting in extreme actions and no learning. 
-Getting it down to 0.05 allowed for efficient learning.
-
-Another important parameter for boosting the training is the learning rate for actor and critic models.
-Values that are too high prevented the agent from achieving high scores while low values slowed down the training process.
-Here is the complete list of hyperparamters with their values after turning.
 
 | Hyperparameter | Value | Description |
 |---|---:|---|
 | Replay buffer size | 1e6 | Maximum size of experience replay buffer |
 | Replay batch size | 128 | Number of experiences sampled in one batch |
-| Actor hidden units | 256, 256 | Number of units in hidden layers of the actor model |
-| Actor critic units | 256, 256 | Number of units in hidden layers of the critic model |
-| Actor learning rate | 3e-4 | Controls parameters update of the online actor model |
-| Critic learning rate | 3e-4 | Controls parameters update of the online critic model |
-| Target update mix | 1e-3 | Controls parameters update of the target actor and critic models |
+| Actor hidden units | 128, 128 | Number of units in hidden layers of the actor model |
+| Actor critic units | 128, 128 | Number of units in hidden layers of the critic model |
+| Actor learning rate | 1e-3 | Controls parameters update of the online actor model |
+| Critic learning rate | 2e-3 | Controls parameters update of the online critic model |
+| Target update mix | 3e-3 | Controls parameters update of the target actor and critic models |
 | Discount factor | 0.99 | Discount rate for future rewards |
 | Ornstein-Uhlenbeck, mu | 0 | Mean of the stochastic  process|
 | Ornstein-Uhlenbeck, theta | 0.15 | Parameter of the stochastic process |
-| Ornstein-Uhlenbeck, sigma | 0.05 | Standard deviation of the stochastic process |
+| Ornstein-Uhlenbeck, sigma | 0.1 | Standard deviation of the stochastic process |
 | Max episodes | 1000 | Maximum number of episodes to train |
 | Max steps | 1e6 | Maximum number of timesteps per episode |
 
 
 ## Results
 
-The agent was able to solve the environment by achieving score above 30 over 100 consecutive episodes after 117 episodes.
-Starting from 40 episodes, the agent was consistently reaching scores close to 40. 
-There are a couple of drops during the training with fast recovery after several episodes.
-
-Plot of the scores:
+The agent was able to achieve an average score of +0.5 over consecutive 100 episodes after 592 
+episodes and +1.0 after 628 episodes. Plot of the scores:
 
 ![Rewards plot](scores.png)
 
 ## Future work
 
-1. A more systematic way of searching of optimal values for hyperparameters, 
-e.g. grid search, random search, bayesian optimization or genetic algorithm
-2. Better control of the exploration-exploitation trade-off by implementing a decreasing schedule for the sigma parameter of the
-Ornstein-Uhlenbeck process
-
+1. Better control of the exploration-exploitation trade-off by implementing a decreasing schedule for the sigma parameter of the
+Ornstein-Uhlenbeck process.
+2. An actor model that learns actions for both agents at the same time, 
+e.g. input are observations and output are actions of both agents.
 
